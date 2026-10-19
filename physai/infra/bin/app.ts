@@ -1,7 +1,13 @@
 #!/usr/bin/env node
 import * as cdk from 'aws-cdk-lib';
-import { ClusterStack, GpuWorkerConfig } from '../lib/cluster-stack';
+import { ClusterStack, GpuWorkerConfig, LOGIN_GROUP_NAME } from '../lib/cluster-stack';
 import { InfraStack } from '../lib/infra-stack';
+import {
+  JOB_INTAKE_STACK_NAME,
+  JobIntakeStack,
+  jobIntakeKeyPairName,
+  parseJobIntakeCallers,
+} from '../lib/job-intake-stack';
 
 const app = new cdk.App();
 
@@ -13,13 +19,17 @@ const gpuWorkers: GpuWorkerConfig[] = app.node.tryGetContext('gpuWorkers') ?? [
 const cpuWorkerType = app.node.tryGetContext('cpuWorkerType') ?? 'ml.m5.2xlarge';
 const cpuWorkerCount = app.node.tryGetContext('cpuWorkerCount') ?? 1;
 
+// Job intake is opt-in. See docs/en/JOB_INTAKE.md.
+const jobIntakeCallers = parseJobIntakeCallers(app.node.tryGetContext('jobIntakeCallers'));
+const jobIntakeEnabled = jobIntakeCallers.length > 0;
+
 const infra = new InfraStack(app, 'PhysaiInfraStack', {
   clusterName,
   fsxCapacityGiB,
   terminationProtection: true,
 });
 
-new ClusterStack(app, 'PhysaiClusterStack', {
+const cluster = new ClusterStack(app, 'PhysaiClusterStack', {
   clusterName,
   vpc: infra.vpc,
   privateSubnet: infra.privateSubnet,
@@ -33,4 +43,19 @@ new ClusterStack(app, 'PhysaiClusterStack', {
   gpuWorkers,
   cpuWorkerType,
   cpuWorkerCount,
+  jobIntake: jobIntakeEnabled
+    ? { keyPairName: jobIntakeKeyPairName(clusterName), stackName: JOB_INTAKE_STACK_NAME }
+    : undefined,
 });
+
+if (jobIntakeEnabled) {
+  new JobIntakeStack(app, JOB_INTAKE_STACK_NAME, {
+    unsuffixedClusterName: clusterName,
+    clusterName: cluster.clusterName,
+    loginGroupName: LOGIN_GROUP_NAME,
+    executionRoleName: cluster.executionRoleName,
+    vpc: infra.vpc,
+    clusterSg: infra.clusterSg,
+    callers: jobIntakeCallers,
+  });
+}

@@ -10,6 +10,9 @@ import * as s3 from 'aws-cdk-lib/aws-s3';
 import * as s3deploy from 'aws-cdk-lib/aws-s3-deployment';
 import * as secretsmanager from 'aws-cdk-lib/aws-secretsmanager';
 import { Construct } from 'constructs';
+import { VPC_CIDR } from './infra-stack';
+
+export const LOGIN_GROUP_NAME = 'login-group';
 
 export interface GpuWorkerConfig {
   name: string;
@@ -31,6 +34,8 @@ export interface ClusterStackProps extends cdk.StackProps {
   gpuWorkers: GpuWorkerConfig[];
   cpuWorkerType: string;
   cpuWorkerCount: number;
+  /** Set when job intake is enabled: which SSH key the login node installs. */
+  jobIntake?: { keyPairName: string; stackName: string };
 }
 
 function hashDirectory(dir: string): string {
@@ -53,6 +58,9 @@ function hashDirectory(dir: string): string {
 }
 
 export class ClusterStack extends cdk.Stack {
+  public readonly clusterName: string;
+  public readonly executionRoleName: string;
+
   constructor(scope: Construct, id: string, props: ClusterStackProps) {
     super(scope, id, props);
     const {
@@ -68,6 +76,7 @@ export class ClusterStack extends cdk.Stack {
       gpuWorkers,
       cpuWorkerType,
       cpuWorkerCount,
+      jobIntake,
     } = props;
 
     const account = cdk.Stack.of(this).account;
@@ -80,12 +89,12 @@ export class ClusterStack extends cdk.Stack {
     // AWS::StackId format: arn:...:stack/<name>/<guid>
     const stackGuid = cdk.Fn.select(2, cdk.Fn.split('/', this.stackId));
     const stackSuffix = cdk.Fn.select(0, cdk.Fn.split('-', stackGuid));
-    const clusterName = `${baseClusterName}-${stackSuffix}`;
+    this.clusterName = `${baseClusterName}-${stackSuffix}`;
 
     // ── Lifecycle Scripts Bucket ──
 
     const lifecycleBucket = new s3.Bucket(this, 'LifecycleBucket', {
-      bucketName: `${clusterName}-lifecycle-${account}-${this.region}`,
+      bucketName: `${this.clusterName}-lifecycle-${account}-${this.region}`,
       removalPolicy: cdk.RemovalPolicy.DESTROY,
       autoDeleteObjects: true,
       blockPublicAccess: s3.BlockPublicAccess.BLOCK_ALL,
@@ -110,6 +119,11 @@ export class ClusterStack extends cdk.Stack {
           rds_port: 3306,
           rds_database: 'slurm_acct_db',
           secret_arn: dbSecret.secretArn,
+          ...(jobIntake && {
+            job_intake_key_name: jobIntake.keyPairName,
+            job_intake_stack_name: jobIntake.stackName,
+            vpc_cidr: VPC_CIDR,
+          }),
         }),
       ],
       destinationBucket: lifecycleBucket,
@@ -121,8 +135,10 @@ export class ClusterStack extends cdk.Stack {
 
     // ── IAM Execution Role ──
 
+    this.executionRoleName = `${this.clusterName}-ExecutionRole`;
+
     const executionRole = new iam.Role(this, 'ExecutionRole', {
-      roleName: `${clusterName}-ExecutionRole`,
+      roleName: this.executionRoleName,
       assumedBy: new iam.ServicePrincipal('sagemaker.amazonaws.com'),
       managedPolicies: [
         iam.ManagedPolicy.fromAwsManagedPolicyName('AmazonSageMakerClusterInstanceRolePolicy'),
@@ -209,7 +225,7 @@ export class ClusterStack extends cdk.Stack {
         InstanceStorageConfigs: [fsxConfig],
       },
       {
-        InstanceGroupName: 'login-group',
+        InstanceGroupName: LOGIN_GROUP_NAME,
         InstanceType: 'ml.c5.large',
         InstanceCount: 1,
         LifeCycleConfig: lifecycleConfig,
@@ -245,7 +261,7 @@ export class ClusterStack extends cdk.Stack {
     const cluster = new cdk.CfnResource(this, 'HyperPodCluster', {
       type: 'AWS::SageMaker::Cluster',
       properties: {
-        ClusterName: clusterName,
+        ClusterName: this.clusterName,
         InstanceGroups: [...fixedGroups, ...gpuGroups, cpuGroup],
         VpcConfig: {
           SecurityGroupIds: [clusterSg.securityGroupId],
@@ -262,14 +278,14 @@ export class ClusterStack extends cdk.Stack {
     cluster.node.addDependency(executionRole);
 
     new cdk.CfnOutput(this, 'ClusterName', {
-      value: clusterName,
+      value: this.clusterName,
       exportName: `${this.stackName}-ClusterName`,
     });
 
     // ── CloudWatch Alarm ──
 
     new cloudwatch.Alarm(this, 'FsxCapacityAlarm', {
-      alarmName: `${clusterName}-fsx-low-capacity`,
+      alarmName: `${this.clusterName}-fsx-low-capacity`,
       metric: new cloudwatch.Metric({
         namespace: 'AWS/FSx',
         metricName: 'FreeStorageCapacity',

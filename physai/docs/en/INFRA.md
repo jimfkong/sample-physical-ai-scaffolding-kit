@@ -1,6 +1,6 @@
 # Infrastructure (CDK)
 
-Deploys the physai platform on AWS using two CDK stacks (TypeScript).
+Deploys the physai platform on AWS using CDK stacks (TypeScript).
 
 ## Stack Overview
 
@@ -8,8 +8,11 @@ Deploys the physai platform on AWS using two CDK stacks (TypeScript).
 |-------|---------|----------|----------------------|
 | **PhysaiInfraStack** | Networking, storage, database | Yes | ON |
 | **PhysaiClusterStack** | HyperPod cluster, IAM, monitoring | No | OFF |
+| **PhysaiJobIntakeStack** | SSH transport to the login node for external callers (opt-in) | No | OFF |
 
 PhysaiInfraStack resources are long-lived — they persist across cluster rebuilds. PhysaiClusterStack is safe to destroy and recreate without losing data.
+
+PhysaiJobIntakeStack is created only when at least one caller is configured in `jobIntakeCallers`; by default it does not exist. See [JOB_INTAKE.md](JOB_INTAKE.md).
 
 ## PhysaiInfraStack
 
@@ -59,7 +62,7 @@ Depends on PhysaiInfraStack.
 ### Lifecycle Scripts
 
 - **Lifecycle scripts bucket** (`<clusterName>-lifecycle-<account>-<region>`): populated via `BucketDeployment` from `infra/lifecycle/`
-- CDK generates `physai-config.json` at deploy time (RDS endpoint, Secrets Manager ARN from PhysaiInfraStack) and deploys it alongside the scripts
+- CDK generates `physai-config.json` at deploy time (RDS endpoint, Secrets Manager ARN from PhysaiInfraStack and, when job intake is enabled, the job-intake key pair to install) and deploys it alongside the scripts
 - HyperPod downloads scripts from this bucket during node provisioning
 
 ### IAM
@@ -104,6 +107,16 @@ Depends on PhysaiInfraStack.
 
 - `ClusterName` — the HyperPod cluster name (suffixed with the stack GUID). Used by `setup-ssh.sh` and other tooling to locate the cluster. Exported as `${stackName}-ClusterName`.
 
+## PhysaiJobIntakeStack
+
+Opt-in; depends on PhysaiClusterStack. Deployed only when `jobIntakeCallers` is non-empty.
+
+The transport through which an external system will submit pipeline runs to the cluster. Owns a login-node SSH key and the submit Lambda, which reaches the login node over SSH, and extends `<clusterName>-ExecutionRole` so the login node can look up the key's public half.
+
+Resource names derive from the **unsuffixed** `clusterName`, so they survive a destroy+redeploy of PhysaiClusterStack.
+
+See [JOB_INTAKE.md](JOB_INTAKE.md) for enabling it and the resources in detail.
+
 ## Configuration
 
 `cdk.json` context:
@@ -117,10 +130,13 @@ Depends on PhysaiInfraStack.
       { "name": "gpu-workers", "instanceType": "ml.g6e.2xlarge", "count": 1 }
     ],
     "cpuWorkerType": "ml.m5.2xlarge",
-    "cpuWorkerCount": 1
+    "cpuWorkerCount": 1,
+    "jobIntakeCallers": []
   }
 }
 ```
+
+`jobIntakeCallers` creates nothing while empty — see [JOB_INTAKE.md](JOB_INTAKE.md).
 
 Users adjust `gpuWorkers` to add/remove GPU instance groups. Examples:
 
@@ -164,6 +180,7 @@ Every lifecycle script sources `_lib.sh`, which auto-detects the node type from 
 | `register_slurm_features.sh` | Compute | Install systemd `.service` + `.path` units that self-register the node's Slurm `Feature` (e.g. `l40s`) via `scontrol update`. The `.path` unit watches `/var/spool/slurmd/conf-cache/slurm.conf` (rewritten by slurmd on every `scontrol reconfigure` in configless mode), so features are re-applied after any reconfigure — necessary because `scontrol update` features don't survive reconfigure in slurmctld's memory. |
 | `install_gdm.sh` | Compute (GPU only) | GNOME desktop + GDM3 with auto-login as `ubuntu`, NVIDIA Xorg driver pinned to the kernel module version, headless `xorg.conf` (DFP-{0..3} virtual display heads). The Xorg session is what IsaacSim renders into and what DCV captures for `--visual` evaluation. |
 | `install_dcv.sh` | Compute (GPU only) | NICE DCV server + persistent `console` session owned by `ubuntu` for visual evaluation. See [PIPELINE_DESIGN.md §5](PIPELINE_DESIGN.md#5-visual-evaluation-via-dcv). |
+| `install_job_intake_key.sh` | Login | When job intake is enabled, install the submit Lambda's SSH public key for `ubuntu`, restricted to connections from the VPC; otherwise remove it. See [JOB_INTAKE.md](JOB_INTAKE.md#the-ssh-key-on-the-login-node). |
 
 ### Authoring lifecycle scripts: HyperPod timing notes
 
